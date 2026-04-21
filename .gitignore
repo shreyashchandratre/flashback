@@ -1,0 +1,18 @@
+# Credentials — never commit these
+.env
+cookies.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Temp audio files
+temp_audio.*
+
+# OS
+.DS_Store
+Thumbs.db
