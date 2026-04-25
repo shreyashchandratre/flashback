@@ -2,6 +2,8 @@ import streamlit as st
 import yt_dlp
 import os
 import json
+import glob
+import subprocess
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -69,20 +71,32 @@ st.markdown("""
         box-shadow: 0 0 35px rgba(124,58,237,0.55), 0 0 15px rgba(45,212,191,0.25) !important;
     }
     .stTabs [data-baseweb="tab-list"] {
-        background: rgba(255,255,255,0.03) !important; border-radius: 12px !important;
-        padding: 4px !important; gap: 4px !important;
-        border: 1px solid var(--glass-border) !important;
+        background: transparent !important;
+        padding: 6px 0 !important; gap: 10px !important;
+        border: none !important;
     }
     .stTabs [data-baseweb="tab"] {
-        background: transparent !important; border-radius: 9px !important;
-        color: var(--muted) !important; font-family: 'Inter', sans-serif !important;
-        font-weight: 500 !important; transition: all 0.25s !important;
+        background: rgba(255,255,255,0.05) !important; 
+        border: 1px solid rgba(168,85,247,0.3) !important;
+        border-radius: 12px !important;
+        color: var(--text) !important; 
+        font-family: 'Inter', sans-serif !important;
+        font-weight: 600 !important; 
+        padding: 8px 16px !important;
+        transition: all 0.3s ease !important;
+    }
+    .stTabs [data-baseweb="tab"]:hover {
+        background: rgba(168,85,247,0.15) !important;
+        border-color: rgba(168,85,247,0.6) !important;
+        transform: translateY(-2px) !important;
     }
     .stTabs [aria-selected="true"] {
-        background: linear-gradient(135deg, rgba(124,58,237,0.4), rgba(13,148,136,0.3)) !important;
-        color: #fff !important; box-shadow: 0 0 18px rgba(168,85,247,0.25) !important;
+        background: linear-gradient(135deg, var(--purple2), var(--teal2)) !important;
+        color: #fff !important; 
+        border-color: transparent !important;
+        box-shadow: 0 4px 15px rgba(124,58,237,0.4) !important;
     }
-    .stTabs [aria-selected="true"] p { color: #fff !important; font-weight: 600 !important; }
+    .stTabs [aria-selected="true"] p { color: #fff !important; font-weight: 700 !important; }
     .glass-card {
         background: var(--glass); border: 1px solid var(--glass-border);
         border-radius: 18px; padding: 28px 32px; margin-bottom: 20px;
@@ -269,10 +283,12 @@ def badge(icon, text, state):
 def download_audio(url):
     cookies_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
     ydl_opts = {
-        'format': 'worstaudio/bestaudio',
+        'format': 'bestaudio/best',
         'outtmpl': 'temp_audio.%(ext)s',
         'quiet': True,
         'no_warnings': True,
+        'retries': 10,
+        'fragment_retries': 10,
         # spoof a real browser to reduce bot detection
         'http_headers': {
             'User-Agent': (
@@ -281,7 +297,7 @@ def download_audio(url):
                 'Chrome/125.0.0.0 Safari/537.36'
             ),
         },
-        'extractor_args': {'youtube': {'player_client': ['web', 'android']}},
+        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'web']}},
     }
     if os.path.exists(cookies_file):
         ydl_opts['cookiefile'] = cookies_file
@@ -308,24 +324,102 @@ def download_audio(url):
         return None
 
 
-def transcribe_audio(file_path, client):
+def transcribe_audio(file_path, client, anim_ph=None):
+    file_size = os.path.getsize(file_path)
+    limit = 24 * 1024 * 1024 # 24 MB API limit
+    
+    if file_size <= limit:
+        if anim_ph:
+            anim_ph.markdown(anim("Step 2/3", "Transcribing audio to text via Whisper...<br><span style='font-size:0.8em;color:var(--teal)'>Processing short video natively...</span>"), unsafe_allow_html=True)
+            
+        import time
+        try:
+            for attempt in range(3):
+                try:
+                    with open(file_path, "rb") as f:
+                        result = client.audio.transcriptions.create(
+                            file=(os.path.basename(file_path), f.read()),
+                            model="whisper-large-v3-turbo",
+                            response_format="text"
+                        )
+                    return result
+                except Exception as e:
+                    if attempt == 2:
+                        st.error(f"Transcription error: {e}")
+                        return None
+                    time.sleep(3)
+        finally:
+            if os.path.exists(file_path):
+                try: os.remove(file_path)
+                except Exception: pass
+
+    # If the file is larger than 24MB, split it with ffmpeg
+    chunk_duration = 600 # 10 minutes per segment to ensure much smaller uploads
+    full_transcript = []
+    base_name = "chunk_temp"
+    ext = os.path.splitext(file_path)[1]
+    
     try:
-        with open(file_path, "rb") as f:
-            result = client.audio.transcriptions.create(
-                file=(os.path.basename(file_path), f.read()),
-                model="whisper-large-v3-turbo",
-                response_format="text"
-            )
-        return result
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        
+        subprocess.run([
+            ffmpeg_exe, '-y', '-i', file_path, '-f', 'segment', 
+            '-segment_time', str(chunk_duration), '-c', 'copy', 
+            f'{base_name}_%03d{ext}'
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        chunks = sorted(glob.glob(f'{base_name}_*{ext}'))
+        
+        import concurrent.futures
+        import time
+        results = [None] * len(chunks)
+        total_chunks = len(chunks)
+        completed = 0
+        
+        if anim_ph:
+            anim_ph.markdown(anim("Step 2/3", f"Transcribing audio to text via Whisper...<br><span style='font-size:0.8em;color:var(--teal)'>Processing segments (0/{total_chunks})</span>"), unsafe_allow_html=True)
+        
+        def process_segment(idx_chunk):
+            idx, chunk = idx_chunk
+            for attempt in range(3):
+                try:
+                    with open(chunk, "rb") as f:
+                        res = client.audio.transcriptions.create(
+                            file=(os.path.basename(chunk), f.read()),
+                            model="whisper-large-v3-turbo",
+                            response_format="text"
+                        )
+                        return idx, res
+                except Exception as loop_e:
+                    if attempt == 2:
+                        raise loop_e
+                    time.sleep(3)
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(process_segment, item) for item in enumerate(chunks)]
+            for future in concurrent.futures.as_completed(futures):
+                idx, text = future.result()
+                results[idx] = text
+                completed += 1
+                if anim_ph:
+                    anim_ph.markdown(anim("Step 2/3", f"Transcribing audio to text via Whisper...<br><span style='font-size:0.8em;color:var(--teal)'>Processing segments ({completed}/{total_chunks})</span>"), unsafe_allow_html=True)
+                
+        return " ".join(results)
+        
+    except FileNotFoundError:
+        st.error("ffmpeg is not installed on this system. Cannot split and process long videos.")
+        return None
     except Exception as e:
-        st.error(f"Transcription error: {e}")
+        st.error(f"Transcription chunking error: {e}")
         return None
     finally:
         if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except Exception:
-                pass
+            try: os.remove(file_path)
+            except Exception: pass
+        for chunk in glob.glob(f'{base_name}_*{ext}'):
+            try: os.remove(chunk)
+            except Exception: pass
 
 
 def analyze_content(transcript, client):
@@ -351,17 +445,21 @@ def analyze_content(transcript, client):
         return None
 
 
-@st.cache_data(show_spinner=False)
-def run_pipeline(url, api_key):
-    client = Groq(api_key=api_key)
-    audio_file = download_audio(url)
-    if not audio_file:
-        return None, None
-    transcript = transcribe_audio(audio_file, client)
-    if not transcript:
-        return None, None
-    analysis = analyze_content(transcript, client)
-    return transcript, analysis
+def answer_question(transcript, question, client):
+    prompt = (
+        "You are a helpful assistant. Use the following transcript to answer the user's question concisely. "
+        "If the answer is not in the transcript, state that clearly.\n\n"
+        f"Transcript:\n{transcript}\n\nQuestion: {question}"
+    )
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error: {e}"
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -371,7 +469,7 @@ def main():
         st.markdown('<div style="color:#94a3b8;font-size:0.78rem;letter-spacing:0.08em;margin-bottom:1.2rem;">CONTENT ARCHITECT</div>', unsafe_allow_html=True)
         st.markdown("---")
         st.markdown('<div class="sidebar-section">📡 Source</div>', unsafe_allow_html=True)
-        youtube_url = st.text_input("YouTube / Podcast URL", placeholder="https://youtu.be/...")
+        youtube_url = st.text_input("Enter your YT URL", placeholder="https://youtu.be/...")
         st.markdown("<br>", unsafe_allow_html=True)
         process_btn = st.button("⚡  Analyse Content")
         st.markdown("---")
@@ -380,7 +478,13 @@ def main():
     st.markdown('<div class="hero-title">FlashBack</div>', unsafe_allow_html=True)
     st.markdown('<div class="hero-sub">YouTube &amp; Podcast Intelligence Engine</div>', unsafe_allow_html=True)
 
-    if not process_btn:
+    if "processed_url" not in st.session_state:
+        st.session_state.processed_url = None
+
+    if process_btn:
+        st.session_state.processed_url = youtube_url
+
+    if not st.session_state.processed_url or st.session_state.processed_url != youtube_url:
         st.markdown(anim("Ready to Analyse", "Paste a URL in the sidebar and hit Analyse Content"), unsafe_allow_html=True)
         return
 
@@ -402,22 +506,49 @@ def main():
         tr_ph.markdown(badge("🎙", "Transcribe", tr), unsafe_allow_html=True)
         an_ph.markdown(badge("🧠", "Analyse",   an), unsafe_allow_html=True)
 
-    set_badges("active", "active", "active")
     anim_ph = st.empty()
-    anim_ph.markdown(anim("Processing Content", "Downloading · Transcribing · Analysing…"), unsafe_allow_html=True)
+    cache_key = f"data_{youtube_url}"
 
-    transcript, analysis = run_pipeline(youtube_url, api_key)
+    if cache_key in st.session_state:
+        transcript, analysis = st.session_state[cache_key]
+        set_badges("done", "done", "done")
+    else:
+        # Step 1: Download
+        set_badges("active", "pending", "pending")
+        anim_ph.markdown(anim("Step 1/3", "Downloading audio...<br><span style='font-size:0.7em;font-weight:400;color:gray;'>(This may take a minute for long videos)</span>"), unsafe_allow_html=True)
+        audio_file = download_audio(youtube_url)
+        if not audio_file:
+            st.session_state.processed_url = None
+            anim_ph.empty()
+            return
+            
+        # Step 2: Transcribe
+        set_badges("done", "active", "pending")
+        anim_ph.markdown(anim("Step 2/3", "Transcribing audio to text via Whisper..."), unsafe_allow_html=True)
+        client = Groq(api_key=api_key, timeout=600.0, max_retries=2)
+        transcript = transcribe_audio(audio_file, client, anim_ph=anim_ph)
+        if not transcript:
+            st.session_state.processed_url = None
+            anim_ph.empty()
+            return
+            
+        # Step 3: Analyze
+        set_badges("done", "done", "active")
+        anim_ph.markdown(anim("Step 3/3", "Structuring insights with Llama 3 70B..."), unsafe_allow_html=True)
+        analysis = analyze_content(transcript, client)
+        if not analysis:
+            st.session_state.processed_url = None
+            anim_ph.empty()
+            return
+            
+        st.session_state[cache_key] = (transcript, analysis)
+        set_badges("done", "done", "done")
 
-    if not transcript or not analysis:
-        anim_ph.empty()
-        return
-
-    set_badges("done", "done", "done")
     anim_ph.empty()
 
     st.markdown("<br>", unsafe_allow_html=True)
-    tab_summary, tab_chapters, tab_transcript = st.tabs([
-        "✦  Key Takeaways", "⏱  Timeline", "📜  Full Transcript"
+    tab_summary, tab_chapters, tab_transcript, tab_qa = st.tabs([
+        "✦  Key Takeaways", "⏱  Timeline", "📜  Full Transcript", "❓  Q&A"
     ])
 
     with tab_summary:
@@ -466,6 +597,31 @@ def main():
             f'<div class="glass-card"><div class="transcript-box">{transcript}</div></div>',
             unsafe_allow_html=True
         )
+
+    with tab_qa:
+        st.markdown('<div class="section-label">Ask About the Content</div>', unsafe_allow_html=True)
+        
+        qa_history_key = f"qa_history_{youtube_url}"
+        if qa_history_key not in st.session_state:
+            st.session_state[qa_history_key] = []
+            
+        for item in st.session_state[qa_history_key]:
+            with st.chat_message("user"):
+                st.write(item["q"])
+            with st.chat_message("assistant"):
+                st.write(item["a"])
+                
+        if prompt_text := st.chat_input("Ask a question about the video..."):
+            with st.chat_message("user"):
+                st.write(prompt_text)
+                
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    client = Groq(api_key=api_key, timeout=60.0)
+                    answer = answer_question(transcript, prompt_text, client)
+                st.write(answer)
+                
+            st.session_state[qa_history_key].append({"q": prompt_text, "a": answer})
 
 
 if __name__ == "__main__":

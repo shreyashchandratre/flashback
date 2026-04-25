@@ -2,3 +2,4 @@ streamlit
 groq
 yt-dlp
 python-dotenv
+imageio-ffmpeg
