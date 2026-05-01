@@ -1,9 +1,8 @@
 import streamlit as st
-import yt_dlp
 import os
 import json
-import glob
-import subprocess
+import re
+from youtube_transcript_api import YouTubeTranscriptApi
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -280,146 +279,19 @@ def badge(icon, text, state):
 
 
 # ── Backend ───────────────────────────────────────────────────────────────────
-def download_audio(url):
-    cookies_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': 'temp_audio.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        'retries': 10,
-        'fragment_retries': 10,
-        # spoof a real browser to reduce bot detection
-        'http_headers': {
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/125.0.0.0 Safari/537.36'
-            ),
-        },
-        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'web']}},
-    }
-    if os.path.exists(cookies_file):
-        ydl_opts['cookiefile'] = cookies_file
+def extract_video_id(url):
+    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", url)
+    return match.group(1) if match else None
 
+def get_youtube_transcript(video_id):
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            return filename
+        api = YouTubeTranscriptApi()
+        transcript_list = api.fetch(video_id)
+        transcript = " ".join([item.text for item in transcript_list])
+        return transcript
     except Exception as e:
-        err = str(e)
-        if 'Sign in' in err or 'bot' in err.lower():
-            st.error(
-                "YouTube is blocking the download. "
-                "Please export your cookies:\n\n"
-                "1. Install the **Get cookies.txt LOCALLY** Chrome extension\n"
-                "2. Go to youtube.com while logged in\n"
-                "3. Click the extension → Export → save as `cookies.txt` "
-                "in the project folder\n"
-                "4. Re-run the analysis"
-            )
-        else:
-            st.error(f"Download error: {e}")
+        st.error(f"Could not fetch transcript: {e}")
         return None
-
-
-def transcribe_audio(file_path, client, anim_ph=None):
-    file_size = os.path.getsize(file_path)
-    limit = 24 * 1024 * 1024 # 24 MB API limit
-    
-    if file_size <= limit:
-        if anim_ph:
-            anim_ph.markdown(anim("Step 2/3", "Transcribing audio to text via Whisper...<br><span style='font-size:0.8em;color:var(--teal)'>Processing short video natively...</span>"), unsafe_allow_html=True)
-            
-        import time
-        try:
-            for attempt in range(3):
-                try:
-                    with open(file_path, "rb") as f:
-                        result = client.audio.transcriptions.create(
-                            file=(os.path.basename(file_path), f.read()),
-                            model="whisper-large-v3-turbo",
-                            response_format="text"
-                        )
-                    return result
-                except Exception as e:
-                    if attempt == 2:
-                        st.error(f"Transcription error: {e}")
-                        return None
-                    time.sleep(3)
-        finally:
-            if os.path.exists(file_path):
-                try: os.remove(file_path)
-                except Exception: pass
-
-    # If the file is larger than 24MB, split it with ffmpeg
-    chunk_duration = 600 # 10 minutes per segment to ensure much smaller uploads
-    full_transcript = []
-    base_name = "chunk_temp"
-    ext = os.path.splitext(file_path)[1]
-    
-    try:
-        import imageio_ffmpeg
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        
-        subprocess.run([
-            ffmpeg_exe, '-y', '-i', file_path, '-f', 'segment', 
-            '-segment_time', str(chunk_duration), '-c', 'copy', 
-            f'{base_name}_%03d{ext}'
-        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
-        chunks = sorted(glob.glob(f'{base_name}_*{ext}'))
-        
-        import concurrent.futures
-        import time
-        results = [None] * len(chunks)
-        total_chunks = len(chunks)
-        completed = 0
-        
-        if anim_ph:
-            anim_ph.markdown(anim("Step 2/3", f"Transcribing audio to text via Whisper...<br><span style='font-size:0.8em;color:var(--teal)'>Processing segments (0/{total_chunks})</span>"), unsafe_allow_html=True)
-        
-        def process_segment(idx_chunk):
-            idx, chunk = idx_chunk
-            for attempt in range(3):
-                try:
-                    with open(chunk, "rb") as f:
-                        res = client.audio.transcriptions.create(
-                            file=(os.path.basename(chunk), f.read()),
-                            model="whisper-large-v3-turbo",
-                            response_format="text"
-                        )
-                        return idx, res
-                except Exception as loop_e:
-                    if attempt == 2:
-                        raise loop_e
-                    time.sleep(3)
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            futures = [executor.submit(process_segment, item) for item in enumerate(chunks)]
-            for future in concurrent.futures.as_completed(futures):
-                idx, text = future.result()
-                results[idx] = text
-                completed += 1
-                if anim_ph:
-                    anim_ph.markdown(anim("Step 2/3", f"Transcribing audio to text via Whisper...<br><span style='font-size:0.8em;color:var(--teal)'>Processing segments ({completed}/{total_chunks})</span>"), unsafe_allow_html=True)
-                
-        return " ".join(results)
-        
-    except FileNotFoundError:
-        st.error("ffmpeg is not installed on this system. Cannot split and process long videos.")
-        return None
-    except Exception as e:
-        st.error(f"Transcription chunking error: {e}")
-        return None
-    finally:
-        if os.path.exists(file_path):
-            try: os.remove(file_path)
-            except Exception: pass
-        for chunk in glob.glob(f'{base_name}_*{ext}'):
-            try: os.remove(chunk)
-            except Exception: pass
 
 
 def analyze_content(transcript, client):
@@ -496,14 +368,12 @@ def main():
         st.sidebar.error("Please provide a YouTube / Podcast URL.")
         return
 
-    col1, col2, col3 = st.columns(3)
-    dl_ph = col1.empty()
-    tr_ph = col2.empty()
-    an_ph = col3.empty()
+    col1, col2 = st.columns(2)
+    tr_ph = col1.empty()
+    an_ph = col2.empty()
 
-    def set_badges(dl, tr, an):
-        dl_ph.markdown(badge("⬇", "Download",  dl), unsafe_allow_html=True)
-        tr_ph.markdown(badge("🎙", "Transcribe", tr), unsafe_allow_html=True)
+    def set_badges(tr, an):
+        tr_ph.markdown(badge("🎙", "Fetch Transcript", tr), unsafe_allow_html=True)
         an_ph.markdown(badge("🧠", "Analyse",   an), unsafe_allow_html=True)
 
     anim_ph = st.empty()
@@ -511,30 +381,29 @@ def main():
 
     if cache_key in st.session_state:
         transcript, analysis = st.session_state[cache_key]
-        set_badges("done", "done", "done")
+        set_badges("done", "done")
     else:
-        # Step 1: Download
-        set_badges("active", "pending", "pending")
-        anim_ph.markdown(anim("Step 1/3", "Downloading audio...<br><span style='font-size:0.7em;font-weight:400;color:gray;'>(This may take a minute for long videos)</span>"), unsafe_allow_html=True)
-        audio_file = download_audio(youtube_url)
-        if not audio_file:
+        # Step 1: Fetch Transcript
+        set_badges("active", "pending")
+        anim_ph.markdown(anim("Step 1/2", "Fetching YouTube Transcript..."), unsafe_allow_html=True)
+        
+        video_id = extract_video_id(youtube_url)
+        if not video_id:
+            st.error("Could not extract video ID from the URL.")
             st.session_state.processed_url = None
             anim_ph.empty()
             return
             
-        # Step 2: Transcribe
-        set_badges("done", "active", "pending")
-        anim_ph.markdown(anim("Step 2/3", "Transcribing audio to text via Whisper..."), unsafe_allow_html=True)
-        client = Groq(api_key=api_key, timeout=600.0, max_retries=2)
-        transcript = transcribe_audio(audio_file, client, anim_ph=anim_ph)
+        transcript = get_youtube_transcript(video_id)
         if not transcript:
             st.session_state.processed_url = None
             anim_ph.empty()
             return
             
-        # Step 3: Analyze
-        set_badges("done", "done", "active")
-        anim_ph.markdown(anim("Step 3/3", "Structuring insights with Llama 3 70B..."), unsafe_allow_html=True)
+        # Step 2: Analyze
+        set_badges("done", "active")
+        anim_ph.markdown(anim("Step 2/2", "Structuring insights with Llama 3 70B..."), unsafe_allow_html=True)
+        client = Groq(api_key=api_key, timeout=600.0, max_retries=2)
         analysis = analyze_content(transcript, client)
         if not analysis:
             st.session_state.processed_url = None
@@ -542,7 +411,7 @@ def main():
             return
             
         st.session_state[cache_key] = (transcript, analysis)
-        set_badges("done", "done", "done")
+        set_badges("done", "done")
 
     anim_ph.empty()
 
@@ -605,23 +474,26 @@ def main():
         if qa_history_key not in st.session_state:
             st.session_state[qa_history_key] = []
             
-        for item in st.session_state[qa_history_key]:
-            with st.chat_message("user"):
-                st.write(item["q"])
-            with st.chat_message("assistant"):
-                st.write(item["a"])
+        chat_container = st.container(height=500)
+        with chat_container:
+            for item in st.session_state[qa_history_key]:
+                with st.chat_message("user"):
+                    st.write(item["q"])
+                if item["a"] is not None:
+                    with st.chat_message("assistant"):
+                        st.write(item["a"])
                 
         if prompt_text := st.chat_input("Ask a question about the video..."):
-            with st.chat_message("user"):
-                st.write(prompt_text)
-                
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    client = Groq(api_key=api_key, timeout=60.0)
-                    answer = answer_question(transcript, prompt_text, client)
-                st.write(answer)
-                
-            st.session_state[qa_history_key].append({"q": prompt_text, "a": answer})
+            st.session_state[qa_history_key].append({"q": prompt_text, "a": None})
+            with chat_container:
+                with st.chat_message("user"):
+                    st.write(prompt_text)
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking..."):
+                        client = Groq(api_key=api_key, timeout=60.0)
+                        answer = answer_question(transcript, prompt_text, client)
+                    st.write(answer)
+            st.session_state[qa_history_key][-1]["a"] = answer
 
 
 if __name__ == "__main__":
